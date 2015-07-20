@@ -1,0 +1,11 @@
+cgc-virtual-competition (7216-cfe-alpha) UNRELEASED; urgency=low
+
+  * build
+
+ -- Brian Caswell <bmc@lungetech.com>  Mon, 20 Jul 2015 14:32:49 +0000
+
+cgc-virtual-competition (1.0) unstable; urgency=low
+
+  * Initial Release.
+
+ -- bmc <bmc@lungetech.com>  Mon, 23 Jun 2014 16:45:08 -0400

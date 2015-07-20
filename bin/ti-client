@@ -1,0 +1,321 @@
+#!/usr/bin/python
+
+"""
+CGC - Sample Team Interface commandline tool
+
+Copyright (C) 2015 - Brian Caswell <bmc@lungetech.com>
+Copyright (C) 2015 - Tim <tim@0x90labs.com>
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in
+all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+THE SOFTWARE.
+"""
+
+
+import argparse
+import cmd
+import logging
+import sys
+import json
+
+sys.path.insert(0, 'lib')
+import ticlient
+
+class InteractiveClient(cmd.Cmd):
+    """
+    Very basic interactive client demonstrating the CGC Team Interface
+    """
+
+    def __init__(self, server, port, username, password, team):
+        cmd.Cmd.__init__(self)
+        self.team = team
+        self.tc = ticlient.TiClient(server, port, username, password)
+
+    def do_consensus(self, data):
+        """
+        Arguments: 
+            consensus <csid> {cb|ids} <team> <round> /tmp
+
+        Get the challenge binaries or IDS rules for the specified challenge set used during the specified round
+
+        Examples:
+            consensus CADET_00001 ids 1 0 /tmp/
+        """
+        args = data.split(' ')
+
+        if len(args) != 5:
+            print 'incorrect usage'
+            return
+        
+        csid, data_type, team, round_id, output_dir = args
+
+        try:
+            results = self.tc.getConsensus(csid, data_type, team, round_id, output_dir)
+        except ticlient.TiError as err:
+            print 'error: %s' % err
+            return
+
+        for filename in results:
+            print 'downloaded: %s' % filename
+
+    def print_feedback_poll(self, data):
+        lines = []
+        for cb in data:
+            msg = []
+            for category in ['functionality', 'performance']:
+                for field in cb[category]:
+                    msg.append('%s: %d' % (field, cb[category][field]))
+            lines.append('%s - %s' % (cb['csid'], ', '.join(msg)))
+
+        lines.sort()
+        print '\n'.join(lines)
+
+    def print_feedback_cb(self, data):
+        for event in data:
+            print '%d %s - signal: %d' % (event['timestamp'], event['cbid'], event['signal'])
+
+    def print_feedback_pov(self, data):
+        print json.dumps(data, sort_keys=True, indent=4)
+
+    def do_upload_ids(self, data):
+        """
+        Arguments:
+            upload_ids <CSID> <filename>
+
+        Upload a new set of IDS rules for the specified challege set.
+
+        Examples:
+            upload_ids CADET_00001 /tmp/CADET_00001.rules
+        """
+
+        args = data.split(' ')
+        if len(args) != 2:
+            print 'incorrect usage'
+            return
+
+        csid, filename = args
+
+        try:
+            round_id = self.tc.uploadIDS(csid, filename)
+        except ticlient.TiError as err:
+            print 'error: %s' % err
+            return
+        
+        print "upload completed during round: %d" % round_id
+
+    def do_upload_rcb(self, data):
+        """
+        Arguments:
+            upload_rcb <CSID> <CBID>:<filename> ...[<CBID_N>:<filename_N>]
+
+        Upload a new set of CBs for the specified challenge set
+
+        Examples:
+            upload_rcb CADET_00001 CADET_00001:/tmp/CADET_00001/bin/CADET_00001_patched
+            upload_rcb LUNGE_00005 LUNGE_00005_3:/tmp/LUNGE_00005/bin/LUNGE_00005_3
+        """
+
+        args = data.split(' ')
+        if len(args) < 2:
+            print 'incorrect usage'
+            return
+
+        csid = args[0]
+        files = []
+       
+        for entry in args[1:]:
+            values = entry.split(':')
+            if len(values) != 2:
+                print 'incorrect format for <cbid:filename>'
+                return
+
+            files.append((values[0], values[1]))
+
+        round_id = None
+        try:
+            round_id = self.tc.uploadRCB(csid, files)
+        except ticlient.TiError as err:
+            print 'error: %s' % err
+            return
+        
+        print "upload completed during round: %d" % round_id
+
+    def do_upload_pov(self, data):
+        """
+        Arguments:
+            upload_pov <CSID> <team> <filename> [<throws>]
+
+        Upload a POV for a specified challenge set targetting a specified team.  Optionally, specify how many times per round to attempt to use the POV.
+
+        Throws defaults to 1.
+        
+        Examples:
+            upload_pov CADET_00001 3 /tmp/CADET_00001/pov/CADET_00001.pov
+            upload_pov CADET_00001 7 /tmp/CADET_00001/pov/CADET_00002.pov 10
+        """
+
+        args = data.split(' ')
+        if len(args) not in [3, 4]:
+            print 'incorrect usage'
+            return
+
+        csid, team, filename =  args[:3]
+
+        throws = '1'
+        if len(args) > 3:
+            throws = args[3]
+        
+        try:
+            round_id = self.tc.uploadPOV(csid, team, throws, filename)
+        except ticlient.TiError as err:
+            print 'error: %s' % err
+            return
+        
+        print "upload completed during round: %d" % round_id
+
+    def do_feedback(self, line):
+        """ 
+        Arguments:
+            feedback {cb|poll|pov} [round_id]
+        
+        Get feedback on Challenges, Polls, or POVs.  Feedback from historical rounds can be specified by providing an optional 'round_id' argument.
+        
+        Examples:
+            feedback cb
+            feedback pov 3
+        """
+
+        args = line.split(' ')
+        
+        if len(args) > 1:
+            round_id = args[1]
+        else:
+            round_id = self.tc.getRound()
+        
+        methods = {'poll': self.print_feedback_poll, 'cb': self.print_feedback_cb, 'pov': self.print_feedback_pov}
+
+        if args[0] not in methods:
+            print 'incorrect usage'
+            return
+            
+        try:
+            methods[args[0]](self.tc.getFeedback(args[0], round_id))
+        except ticlient.TiError as err:
+            print 'error: %s' % err
+            return
+ 
+    def do_counts(self,line):
+        """ counts of various items """
+        try:
+            for k,v in self.tc.getCounts().iteritems():
+                print "%s: %s" % (k, v)
+        except ticlient.TiError as err:
+            print 'error: %s' % err
+            return
+
+    def do_teams(self, line):
+        """ gets list of teams"""
+
+        try:
+            print ', '.join('%d' % i for i in self.tc.getTeams())
+        except ticlient.TiError as err:
+            print 'error: %s' % err
+            return
+
+    def do_round(self, line):
+        """ get current round """
+
+        try:
+            print self.tc.getRound()
+        except ticlient.TiError as err:
+            print 'error: %s' % err
+            return
+
+    def do_scoreboard(self, line):
+        """ gets scores"""
+
+        try:
+            for t,s in self.tc.getScores():
+               print "%s: %s" % (t, s)
+        except ticlient.TiError as err:
+            print 'error: %s' % err
+            return
+
+    def do_exit(self, line):
+        """ exit """
+        return True 
+    
+    def do_EOF(self, line):
+        """ exit """
+        return True 
+
+    def emptyline(self):
+        pass
+
+
+def main():
+
+   formatter = argparse.ArgumentDefaultsHelpFormatter
+   parser = argparse.ArgumentParser(description='Sample Team Interface client', 
+                                    formatter_class=formatter)
+
+   # required = parser.add_argument_group(title='required')
+   parser.add_argument('--hostname', required=False, type=str, default='localhost', help='hostname of TI server')
+
+   parser.add_argument('--port', required=False, type=str, default=1996, help='TCP port')
+
+   parser.add_argument('--debug', required=False, action='store_true', default=False, 
+                       help='Enable debugging')
+
+   parser.add_argument('--log', required=False, type=str, help='Log filename')
+
+   parser.add_argument('--username', required=False, type=str, default="vagrant", help='username')
+
+   parser.add_argument('--password', required=False, type=str, default="vagrant", 
+                       help='password associated with user')
+   parser.add_argument('--team', required=False, type=int, default=1, help='Team Number')
+   
+   args = parser.parse_args()
+
+
+   logger = logging.getLogger()
+   logger.setLevel(logging.INFO)
+   if args.debug:
+      logger.setLevel(logging.DEBUG)
+
+   if args.log is not None:
+      log_fh = open(args.log, 'w')
+   else:
+      log_fh = sys.stdout
+
+   log_handler = logging.StreamHandler(log_fh)
+   log_handler.setFormatter(logging.Formatter('# %(message)s'))
+
+   logger.addHandler(log_handler)
+
+   if log_fh != sys.stdout:
+      error_handler = logging.StreamHandler(sys.stdout)
+      error_handler.setLevel(logging.ERROR)
+      error_handler.setFormatter(logging.Formatter('# %(message)s'))
+      logger.addHandler(error_handler)
+
+   ic = InteractiveClient(args.hostname, args.port, args.username, args.password, args.team)
+   ic.prompt = "ti-client> "
+   ic.cmdloop()
+
+if __name__ == "__main__":
+    main()

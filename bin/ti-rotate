@@ -1,0 +1,694 @@
+#!/usr/bin/python
+
+import sys
+import os
+import json
+import argparse
+import time
+import signal
+import hashlib
+#import subprocess
+import random
+import logging
+import fcntl
+import binascii
+import shutil
+
+def try_makedirs(d):
+    if os.path.isdir(d):
+         return
+    os.makedirs(d)
+
+def hash_file(filename):
+    sha = hashlib.sha256()
+
+    with open(filename, "r") as infile:
+        while True:
+            block = infile.read(65536)
+            if not block:
+                break
+            sha.update(block)
+    return sha.hexdigest()
+
+def make_uri(path):
+    return path.split('webroot')[-1]
+
+def set_add(_list, _item):
+    if _item not in _list:
+        _list.append(_item)
+
+def mutate_ids(path, team):
+    logging.debug("mutating ids %s for team %d" % (path, team))
+    with open(path, 'r') as ids:
+        content = ids.read()
+
+    content += "#hello world\n"
+    filter_hash = hashlib.sha256(content).hexdigest()
+    parts = path.split(os.sep)
+    parts[-3] = str(team)
+    
+    mutate_time = int(time.time())
+    
+    name_parts = parts[-1].split('_')[:-2]
+    name_parts.append(filter_hash)
+    name_parts.append("%d.ids" % mutate_time)
+    parts[-1] = '_'.join(name_parts)
+    
+    new_path = os.sep + os.path.join(*parts)
+    with open(new_path, 'w') as f:
+        f.write(content)
+    
+    return (new_path, filter_hash)
+
+def mutate_rcb(path, team):
+    logging.debug("mutating rcb %s for team %d" % (path, team))
+
+    mutate_time = int(time.time())
+    tmpname = binascii.hexlify(os.urandom(7))
+
+    parts = path.split(os.sep)
+    parts[-3] = str(team)
+    oldname = parts[-1]
+    parts[-1] = tmpname
+    new_path = os.sep + os.path.join(*parts)
+    result = None
+    shutil.copyfile(path, new_path)
+    with open(new_path, 'r+') as f:
+        f.seek(9)
+        f.write(os.urandom(7))
+
+    new_hash = hash_file(new_path)
+
+    name_parts = oldname.split('_')[:-2]
+    name_parts.append(new_hash)
+    name_parts.append("%d" % mutate_time)
+    parts[-1] = '_'.join(name_parts)
+    final_path = os.sep + os.path.join(*parts)
+    os.rename(new_path, final_path)
+    
+    return (final_path, new_hash)
+
+def is_locked(path):
+    result = False
+    
+    with open(path, 'r') as f:
+        try:
+            fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except IOError:
+            result = True
+    
+    return result
+
+class Rotator(object):
+    def __init__(self, seconds, webroot, cbdir, team):
+        self.round_length = seconds
+
+        #where files are served from, where we need to save our json
+        self.web_root = webroot
+        # self.cbdir = cbdir
+
+        self.round_num = 0
+
+        self.my_team = team
+        self.csets = {}
+        self.round_time = 0
+        self.installed_povs = {}
+        
+        self.teams = [i for i in range(1, 8)]
+        self.installed_cbs = {team:{} for team in self.teams}
+        self.installed_filters = {team:{} for team in self.teams}
+        self.scores = {i:0 for i in self.teams}
+        self.signals = [signal.SIGILL, signal.SIGSEGV, signal.SIGBUS]
+
+        self.my_cbs = self.installed_cbs[self.my_team]
+        self.my_filters = self.installed_filters[self.my_team]
+
+        try_makedirs(self.web_root)
+
+        self.write_round_num()
+        self.install_cbs(cbdir)
+        self.install_filters()
+
+    def write_round_num(self):
+        with open(os.path.join(self.web_root, "cgc-round"), "w") as round_file:
+            round_file.write("%d" % self.round_num)
+
+    def install_cbs(self, cbdir):
+        #The binaries in this directory form the valid set of cbs for
+        #the purposes of the CFE simulator
+        (dirpath, dirnames, _) = os.walk(cbdir).next()
+        #TODO: now copy these into the round 0 evaluation directory
+
+        install_time = int(time.time())
+
+        #need to setup a dict that represents csids and number of associated cbs
+        for csid in dirnames:
+            (csidpath, _, cbnames) = os.walk(os.path.join(cbdir, csid, "bin")).next()
+            for cb in cbnames:
+                if '_patched' in cb:
+                    continue
+                if csid in self.csets:
+                    self.csets[csid] += 1
+                else:
+                    self.csets[csid] = 1
+
+                cb_loc = os.path.join(csidpath, cb)
+                cbhash = hash_file(cb_loc)
+
+                #install initial CBS to all teams
+                for team in self.teams:
+                    #make sure download directories are created
+                    cb_install_dir = os.path.join(self.web_root, "dl", str(team), "cb")
+                    try_makedirs(cb_install_dir)
+                    install_path = os.path.join(cb_install_dir, "%s_%s_%d" % (cb, cbhash, install_time))
+                    shutil.copyfile(cb_loc, install_path)
+                    self.installed_cbs[team][cb] = {"timestamp":0, "csid":csid, "path":install_path, "hash":cbhash}
+
+    def install_filters(self):
+        #install initial filters to all teams
+        
+        base_ids_rule = '#empty\n'
+        install_time = int(time.time())
+        filter_hash = hashlib.sha256(base_ids_rule).hexdigest()
+
+        for team in self.teams:
+            ids_install_dir = os.path.join(self.web_root, "dl", str(team), "ids")
+            try_makedirs(ids_install_dir)
+
+            for csid in self.csets:
+                install_path = os.path.join(ids_install_dir, "%s_%s_%d.ids" % (csid, filter_hash, install_time))
+
+                with open(install_path, "wb") as ids_filter:
+                    ids_filter.write(base_ids_rule)
+
+                self.installed_filters[team][csid] = {"timestamp":install_time, "path":install_path, "hash":filter_hash}
+
+    def issue_povs(self):
+        if self.round_num == 0:
+            return
+
+        for team in self.teams:
+            if team != self.my_team:
+                chance = random.randrange(1000)
+                if chance < 50:
+                    #give this team a new pov
+                    #perhaps scp it to pov thrower to throw against self.my_team
+                    #choose a pov from self.installed_povs to donate to this team
+                    pass
+
+    def issue_ids(self):
+        if self.round_num == 0:
+            return
+        for team in self.teams:
+            if team != self.my_team:
+                chance = random.randrange(1000)
+                if chance < 50:
+                    #give this team a new ids_filter
+                    while True:
+                        donor = random.randint(1, 7)
+                        if donor != team and len(self.installed_filters[donor]) > 0:
+                            filters = self.installed_filters[donor]
+                            csids = filters.keys()
+                            rand_csid = random.choice(csids)
+                            ids_filter = filters[rand_csid]
+                            new_path, new_hash = mutate_ids(ids_filter['path'], team)
+                            new_filt = {}
+                            new_filt['timestamp'] = int(time.time())
+                            new_filt['hash'] = new_hash
+                            new_filt['path'] = new_path
+                            self.installed_filters[team][rand_csid] = new_filt
+                            break
+
+    def issue_rcbs(self):
+        if self.round_num == 0:
+            return
+
+        for team in self.teams:
+            if team != self.my_team:
+                chance = random.randrange(1000)
+                if chance < 50:
+                    #give this team a new rcb
+                    while True:
+                        donor = random.randint(1, 7)
+                        if donor != team and len(self.installed_filters[donor]) > 0:
+                            rcbs = self.installed_cbs[donor]
+                            cbids = rcbs.keys()
+                            rand_cbid = random.choice(cbids)
+                            rcb = rcbs[rand_cbid]
+                            new_path, new_hash = mutate_rcb(rcb['path'], team)
+                            new_rcb = {}
+                            new_rcb['timestamp'] = int(time.time())
+                            new_rcb['hash'] = new_hash
+                            new_rcb['path'] = new_path
+                            new_rcb['csid'] = rcb['csid']
+                            self.installed_cbs[team][rand_cbid] = new_rcb
+                            break
+
+    def distribute_pov(self):
+        install_path = os.path.join(self.web_root, "dl", str(self.my_team), "pov")
+        try_makedirs(install_path)
+
+        pov_dir = os.path.join(self.web_root, 'pov')
+        try:
+            (dirpath, _, new_povs) = os.walk(pov_dir).next()
+        except StopIteration:
+            logging.error("No POVs to distribute")
+            new_povs = []
+        
+        #TODO: update map of currently installed povs
+        #csid -> povname (with hash suffix)
+        temp_povs = {} #handle multiple submissions against same csid
+        for pov in new_povs:
+            pov_file = os.path.join(dirpath, pov)
+            if is_locked(pov_file):
+                #still being written by web server
+                continue
+
+            parts = pov.split('_')
+            ts = int(parts[-1][:-4]) # timestamp
+            throws = int(parts[-2])
+            tgt_team = int(parts[-3])
+            pov_hash = parts[-4]
+            csid = '_'.join(parts[:-4])
+            record = {"timestamp":ts, "throws":throws, "path":pov, "hash":pov_hash}
+            if csid in temp_povs:
+                teams = temp_povs[csid]
+                if tgt_team in teams:
+                    newest = teams[tgt_team]
+                    if ts > newest["timestamp"]:
+                        os.rename(os.path.join(pov_dir, newest["path"]), install_path)
+                        teams[tgt_team] = record
+                    else:
+                        os.rename(os.path.join(pov_file), install_path)
+                else:
+                    temp_povs[csid][tgt_team] = record
+            else:
+                temp_povs[csid] = {tgt_team:record}
+
+        #remember the newsest of each and move them
+        self.installed_povs.update(temp_povs)
+        for csid in temp_povs.items():
+            for pov in csid[1].items():
+                #TODO - could shell out to scp any submitted povs to thrower ??
+                #subprocess.check_call(["scp", os.path.join(pov_dir, pov[1]["path"]), self.pov_thrower])
+                dest_name = os.path.join(install_path, pov[1]["path"])
+                os.rename(os.path.join(pov_dir, pov[1]["path"]), dest_name)
+                #update path to reflect new location
+                pov[1]["path"] = dest_name
+
+        self.issue_povs()
+
+    def write_consensus_ids(self, eval_dir):
+        for filters in self.installed_filters.items():
+            #filters will be a tuple of (team, installed_filters)
+            eval_path = os.path.join(eval_dir, str(filters[0]))
+            status = {}
+
+            ids_list = []
+            installed = filters[1]
+            for ids_filter in installed.items():
+                filt = {}
+                filt['csid'] = ids_filter[0]
+                filt['hash'] = ids_filter[1]['hash']
+                filt['uri'] = make_uri(ids_filter[1]['path'])
+                ids_list.append(filt)
+
+            status["ids"] = ids_list
+
+            with open(eval_path, 'wb') as status_file:
+                status_file.write(json.dumps(status))
+
+    def distribute_ids(self, eval_dir):
+        install_path = os.path.join(self.web_root, "dl", str(self.my_team), "ids")
+        try_makedirs(install_path)
+
+        #TODO - shell out to scp any submitted filters to network appliance ??
+
+        filter_dir = os.path.join(self.web_root, 'ids')
+
+        try:
+            (dirpath, _, new_filters) = os.walk(filter_dir).next()
+        except StopIteration:
+            logging.error("No IDS filters to distribute")
+            new_filters = []
+
+        #TODO: update map of currently installed filters
+        #csid -> filtername (with hash suffix)
+
+        temp_ids = {} #handle multiple submissions against same csid
+        #now move to evaluation directory
+        for ids_filter in new_filters:
+            filter_file = os.path.join(dirpath, ids_filter)
+            if is_locked(filter_file):
+                #still being written by web server
+                continue
+
+            parts = ids_filter.split('_')
+            ts = int(parts[-1][:-4])
+            ids_hash = parts[-2]
+            csid = '_'.join(parts[:-2])
+            record = {"timestamp":ts, "path":ids_filter, "hash":ids_hash}
+            if csid in temp_ids:
+                newest = temp_ids[csid]
+                if ts > newest["timestamp"]:
+                    os.rename(os.path.join(filter_dir, newest["path"]), install_path)
+                    temp_ids[csid] = record
+                else:
+                    os.rename(os.path.join(filter_file), install_path)
+            else:
+                temp_ids[csid] = record
+
+        self.my_filters.update(temp_ids)
+        for ids_filter in temp_ids.items():
+            #TODO - could shell out to scp any submitted filters from previous round to network appliance ??
+            #subprocess.check_call(["scp", os.path.join(filter_dir, filter[1]["path"]), self.network_appliance])
+            #all new filters in temp_ids are now available for consensus evaluation
+            #but will not run until the next round
+            filter_name = os.path.join(filter_dir, ids_filter[1]["path"])
+            logging.debug("Installing %s as replacement ids filter", filter_name)
+            os.rename(os.path.join(filter_dir, ids_filter[1]["path"]), install_path)
+            #update path to reflect new location
+            ids_filter[1]["path"] = os.path.join(install_path, ids_filter[1]["path"])
+
+        self.issue_ids()
+        self.write_consensus_ids(eval_dir)
+
+    def write_consensus_rcb(self, eval_dir):
+        for rcbs in self.installed_cbs.items():
+            #filters will be a tuple of (team, installed_filters)
+            eval_path = os.path.join(eval_dir, str(rcbs[0]))
+            status = {}
+
+            rcb_list = []
+            installed = rcbs[1]
+            for rcb in installed.items():
+                rb = {}
+                rb['cbid'] = rcb[0]
+                rb['hash'] = rcb[1]['hash']
+                rb['csid'] = rcb[1]['csid']
+                rb['uri'] = make_uri(rcb[1]['path'])
+                rcb_list.append(rb)
+
+            status["cb"] = rcb_list
+
+            with open(eval_path, "w") as status_file:
+                status_file.write(json.dumps(status))
+
+    def distribute_rcb(self, eval_dir):
+        install_path = os.path.join(self.web_root, "dl", str(self.my_team), "cb")
+        try_makedirs(install_path)
+
+        #TODO - shell out to scp any submitted rcbs to defended host ??
+        rcb_dir = os.path.join(self.web_root, 'rcb')
+       
+        try:
+            (dirpath, _, new_rcb) = os.walk(rcb_dir).next()
+        except StopIteration:
+            logging.error("No RCBs to distribute")
+            new_rcb = []
+
+        #TODO: update map of currently installed rcbs
+        #cbid -> filename (with hash suffix)
+
+        temp_rcb = {} #handle multiple submissions against same csid
+
+        #now move to evaluation directory
+        for rcb in new_rcb:
+            rcb_file = os.path.join(dirpath, rcb)
+            if is_locked(rcb_file):
+                #still being written by web server
+                continue
+
+            parts = rcb.split('_')
+            ts = int(parts[-1])
+            rcb_hash = parts[-2]
+            cbid = '_'.join(parts[:-2])
+
+            csid = parts[0]
+            parts_idx = 1
+            while True:
+                if csid in self.csets:
+                    break
+                csid += "_" + parts[parts_idx]
+                parts_idx += 1
+
+            record = {"timestamp":ts, "csid":csid, "path":rcb, "hash":rcb_hash}
+            if cbid in temp_rcb:
+                newest = temp_rcb[cbid]
+                if ts > newest["timestamp"]:
+                    source = os.path.join(dirpath, newest['path'])
+                    dest = os.path.join(install_path, os.path.basename(source))
+                    os.rename(source, dest)
+                    temp_rcb[cbid] = record
+                else:
+                    dest = os.path.join(install_path, os.path.basename(rcb_file))
+                    os.rename(rcb_file, dest)
+            else:
+                temp_rcb[cbid] = record
+
+        self.my_cbs.update(temp_rcb)
+        for rcb in temp_rcb.items():
+            #TODO - could shell out to scp any submitted rcbs from previous round to defended host ??
+            #subprocess.check_call(["scp", os.path.join(rcb_dir, rcb[1]["path"]), self.def_host])
+            #all new rcbs in temp_rcbs are now available for consensus evaluation
+            #but will not run until the next round
+            rcb_path = os.path.join(rcb_dir, rcb[1]["path"])
+            logging.debug("Installing %s as replacement CB", rcb_path)
+            os.rename(rcb_path, os.path.join(install_path, os.path.basename(rcb_path)))
+            #update path to reflect new location
+            rcb[1]["path"] = os.path.join(install_path, rcb[1]["path"])
+
+        self.issue_rcbs()
+        self.write_consensus_rcb(eval_dir)
+
+    def build_poll_summary_list(self):
+        result = []
+        for csid in self.csets:
+            poll = {}
+            poll['csid'] = csid
+            #TODO tie in to actual poller result log??
+            func = {}
+            success = random.uniform(0.85, 1.0)
+            func['success'] = int(success * 100)
+            #3 broad categories of failures: bad connect, timout, and other
+            failures = 1.0 - success
+            timeout = random.uniform(0.0, failures) # some % of failures
+            func['timeout'] = int(timeout * 100)
+            func['connect'] = int(random.uniform(0.0, failures - timeout) * 100) #some % of remaining
+            poll['functionality'] = func
+            perf = {}
+            perf['time'] = int(random.uniform(0.85, 1.15) * 100)
+            perf['memory'] = int(random.uniform(0.85, 1.15) * 100)
+            poll['performance'] = perf
+            result.append(poll)
+        return result
+
+    def write_poll_feedback(self, path):
+        #generate poll summary
+        poll = {}
+
+        result_list = self.build_poll_summary_list()
+        poll['poll'] = result_list
+
+        with open(os.path.join(path, "poll"), "wb") as poll_file:
+            poll_file.write(json.dumps(poll))
+
+    def build_pov_result_list(self):
+        #TODO - implement me
+        result = []
+        for csid in self.installed_povs.items():
+            for pov in csid[1].items():
+                for throw in range(pov[1]["throws"]):
+                    attempt = {}
+                    attempt["csid"] = csid[0]
+                    attempt["team"] = pov[0]
+                    attempt["throw"] = throw + 1
+
+                    #pick a random result
+                    #TODO tie in to actual thrower result log??
+                    if random.randint(0, 1) == 1:
+                        attempt["result"] = "success"
+                    else:
+                        attempt["result"] = "fail"
+                    result.append(attempt)
+        return result
+
+    def write_pov_feedback(self, path):
+        #generate pov summary
+        pov = {}
+
+        result_list = self.build_pov_result_list()
+        pov['pov'] = result_list
+
+        with open(os.path.join(path, "pov"), "w") as pov_file:
+            pov_file.write(json.dumps(pov))
+
+    def build_crash_list(self):
+        #report small, random number of crashes
+        crashes = random.randrange(10)
+        crash_list = []
+
+        for c in range(crashes):
+            crash = {}
+
+            #need to obtain a cbid here
+            cset_id = random.choice(self.csets.items())
+            crash["cbid"] = cset_id[0]
+            if cset_id[1] > 1:    # this is a multi cb set
+                crash["cbid"] += "_%d" % random.randint(1, cset_id[1])
+
+            #pick random timestamp in the last round
+            rel_time = random.randrange(self.round_length + 1)
+            crash["timestamp"] = self.round_time + rel_time
+
+            #pick random signal number
+            crash["signal"] = random.choice(self.signals)
+
+            crash_list.append(crash)
+        return crash_list
+
+    def write_cb_feedback(self, path):
+        #generate poll summary
+        cb = {}
+        cb["cb"] = self.build_crash_list()
+        with open(os.path.join(path, "cb"), "w") as cb_file:
+            cb_file.write(json.dumps(cb))
+
+    def update_scores(self):
+        for t in self.scores:
+            self.scores[t] += random.randrange(100)
+
+    def write_status(self):
+        status = {}
+        status["round"] = self.round_num
+        score_list = []
+        place = len(self.scores)
+        for score in sorted(self.scores.items(), key=lambda x: x[1]):
+            team = {}
+            team["team"] = score[0]
+            team["score"] = score[1]
+            team["rank"] = place
+            score_list.append(team)
+            place -= 1
+        status["scores"] = score_list
+        with open(os.path.join(self.web_root, "status"), "w") as status_file:
+            status_file.write(json.dumps(status))
+
+    def run(self, rounds):
+        while True:
+            self.round_time = int(time.time())
+            self.write_round_num()
+            logging.debug("%s Starting round: %d", time.ctime(self.round_time), self.round_num)
+
+            #make sure this round's evaluation directory exists
+            path = os.path.join(self.web_root, "round", str(self.round_num), "evaluation", "cb")
+            try_makedirs(path)
+            #move stuff to download directories
+            self.distribute_rcb(path)
+
+            path = os.path.join(self.web_root, "round", str(self.round_num), "evaluation", "ids")
+            try_makedirs(path)
+            self.distribute_ids(path)
+
+            self.distribute_pov()
+
+            #make sure this round's feedback directory exists
+            path = os.path.join(self.web_root, "round", str(self.round_num), "feedback")
+            try_makedirs(path)
+
+            self.write_poll_feedback(path)
+            self.write_pov_feedback(path)
+            self.write_cb_feedback(path)
+
+            if self.round_num > 0:
+                self.update_scores()
+
+            #update status file
+            self.write_status()
+
+            #sleep until end of round
+            time.sleep(self.round_length)
+            self.round_num += 1
+            if rounds is not None and self.round_num >= rounds:
+                break
+
+def show_warning():
+     warning = ("WARNING: Virtual Competition for finals in DARPA's Cyber Grand "
+                    "Challenge, for use in verifying the API capability with the "
+                    "competition framework. Data created by the virtual "
+                    "competition is synthetic in nature and is only intended to be "
+                    "used to test the API compatibility of competitor's CRSs.\n")
+     print warning
+
+def main():
+    show_warning()
+
+    formatter = argparse.ArgumentDefaultsHelpFormatter
+    parser = argparse.ArgumentParser(description='Simulate rotation of CFE rounds',
+                                                formatter_class=formatter)
+
+    required = parser.add_argument_group(title='required')
+    required.add_argument('--roundlen', required=True, type=int,
+                                 help='Length of a round in seconds')
+
+    parser.add_argument('--debug', required=False, action='store_true',
+                              default=False, help='Enable debugging')
+
+    parser.add_argument('--log', required=False, type=str, help='Log filename')
+
+    parser.add_argument('--cbdir', required=False, type=str, default='/usr/share/cgc-challenges',
+                              help='Initial CB directory')
+
+    parser.add_argument('--webroot', required=False, type=str,
+                              default="/tmp/virtual-competition/webroot",
+                              help='ti-server web root directory, attempts to create if it does not exist')
+
+    parser.add_argument('--team', required=False, type=int, default=1, help='Simulate playing as the specified team (0-7)')
+    parser.add_argument('--rounds', required=False, type=int, help='How many rounds to simulate')
+
+    args = parser.parse_args()
+
+    round_length = args.roundlen
+
+    assert os.path.isdir(args.cbdir), "--cbdir is not a directory: %s. Virtual Competition requires CBs to be present." % args.cbdir
+
+
+    if round_length < 0:
+        logging.error("Round length must be a positive integer\n")
+        sys.exit(1)
+
+    if args.rounds is not None:
+        assert args.rounds > 0
+
+    logger = logging.getLogger()
+    logger.setLevel(logging.WARNING)
+    if args.debug:
+        logger.setLevel(logging.DEBUG)
+
+    if args.log is not None:
+        log_fh = open(args.log, 'w')
+    else:
+        log_fh = sys.stdout
+
+    log_handler = logging.StreamHandler(log_fh)
+    log_handler.setFormatter(logging.Formatter('# %(message)s'))
+
+    logger.addHandler(log_handler)
+
+    if log_fh != sys.stdout:
+        error_handler = logging.StreamHandler(sys.stdout)
+        error_handler.setLevel(logging.ERROR)
+        error_handler.setFormatter(logging.Formatter('# %(message)s'))
+        logger.addHandler(error_handler)
+
+    webroot_abs = os.path.abspath(args.webroot)
+
+    rotator = Rotator(round_length, webroot_abs, args.cbdir, args.team)
+    try:
+        rotator.run(args.rounds)
+    except KeyboardInterrupt:
+        logger.warning('interrupted')
+    return 0
+
+if __name__ == "__main__":
+    exit(main())

@@ -1,0 +1,11 @@
+cgc-virtual-competition (9083-cfe-rc4) UNRELEASED; urgency=low
+
+  * build
+
+ -- Brian Caswell <bmc@lungetech.com>  Mon, 29 Feb 2016 16:40:00 +0000
+
+cgc-virtual-competition (1.0) unstable; urgency=low
+
+  * Initial Release.
+
+ -- bmc <bmc@lungetech.com>  Mon, 23 Jun 2014 16:45:08 -0400

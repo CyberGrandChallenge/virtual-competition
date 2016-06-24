@@ -1,0 +1,618 @@
+#!/usr/bin/python
+
+"""
+CGC - Sample Team Interface executable
+
+Under 17 U.S.C section 105 US Government Works are not subject to domestic copyright
+protection.
+"""
+
+import daemon
+import argparse
+import SimpleHTTPServer
+import SocketServer
+import hashlib
+import cgi
+import os
+import re
+import struct
+import binascii
+import sys
+import json
+import ids
+import time
+import fcntl
+import logging
+import subprocess
+import tempfile
+
+def try_makedirs(path):
+    # path = "%s%s%s" % (os.curdir, os.sep, directory)
+    if os.path.isdir(path):
+        return
+    os.makedirs(path)
+
+def get_current_round():
+    res = 1
+    path = os.path.join(os.curdir, 'cgc-round')
+
+    if os.path.exists(path):
+        with open(path, 'rb') as round_file:
+            res = int(round_file.read().strip())
+    
+    return res
+
+def hash_file(infile):
+    infile.seek(0)
+    sha256 = hashlib.sha256()
+    while True:
+        block = infile.read(65536)
+        if not block:
+            break
+        sha256.update(block)
+    return sha256.hexdigest()
+
+def file_size(infile):
+    infile.seek(0, 2)
+    return infile.tell()
+
+def write_from_file(infile, outfilename):
+    infile.seek(0)
+    outfile = open(outfilename, 'w')
+    fcntl.flock(outfile, fcntl.LOCK_EX)
+    while True:
+        block = infile.read(65536)
+        if block:
+            outfile.write(block)
+        else:
+            break
+    outfile.close()
+
+def write_to_file(infilename, outfile):
+    infile = open(infilename, 'r')
+    while True:
+        block = infile.read(65536)
+        if block:
+            outfile.write(block)
+        else:
+            break
+    infile.close()
+
+PT_NULL = 0  # Unused header
+PT_LOAD = 1  # Segment loaded into mem
+PT_PHDR = 6  # Program hdr tbl itself
+PT_CGCPOV2 = 0x6ccccccc  # CFE Type 2 PoV flag sect
+
+class TcpServer(SocketServer.TCPServer):
+    allow_reuse_address = True
+
+class TeamInterfaceHandler(SimpleHTTPServer.SimpleHTTPRequestHandler):
+    allow_reuse_address = True
+    config = None
+    nonces = {}
+    sessions = []
+    ids_parser = ids.ids_parser.ids_parser()
+
+    files = {re.compile("^/round/[0-9]+/feedback/cb$"): 'application/json', # CB Stats
+             re.compile("^/status$"): 'application/json',  # Game status
+             re.compile("^/round/[0-9]+/feedback/pov$"): 'application/json',  # POV Status
+             re.compile("^/round/[0-9]+/feedback/poll$"): 'application/json',  # Poll status
+             re.compile("^/round/[0-9]+/evaluation/cb/[1-7]$"): 'application/json',  # Other team's reformulated CB status
+             re.compile("^/round/[0-9]+/evaluation/ids/[1-7]$"): 'application/json',  # Other team's IDS status
+             re.compile("^/dl/[1-7]/cb/[0-9a-zA-Z_]+$"): 'application/octet-stream',  # Reforumated CB downloads
+             re.compile("^/dl/[1-7]/ids/[0-9a-zA-Z_]+\\.ids$"): 'text/plain'}  # IDS Rule downloads
+
+    def is_valid_csid(self, csid):
+        return csid in self.config["challenges"]
+
+    def is_valid_cbid(self, cbid):
+        challenges = self.config["challenges"]
+
+        if cbid in challenges and challenges[cbid] == 1:
+            return True
+
+        if '_' not in cbid:
+            return False
+
+        last = cbid.rfind('_')
+        csid = cbid[:last]
+        try:
+            cbnum = int(cbid[last + 1:])
+        except ValueError:
+            return False
+
+        return csid in challenges and cbnum > 0 and cbnum <= challenges[csid]
+
+    def is_valid_cb_name(self, form_csid, cbname):
+        return self.is_valid_cbid(cbname) and cbname.startswith(form_csid)
+
+    def set_headers(self, code, headers=None):
+        self.send_response(code)
+
+        if headers is None:
+            headers = {}
+        for hdr in headers:
+            self.send_header(hdr, headers[hdr])
+        self.end_headers()
+
+    @staticmethod
+    def rand_str(length):
+        return binascii.hexlify(os.urandom(length))
+
+    def need_auth(self):
+        nonce = self.rand_str(16)
+        opaque = self.rand_str(16)
+        TeamInterfaceHandler.nonces[nonce] = opaque
+        headers = {}
+        headers['WWW-Authenticate'] = 'Digest realm="%s",qop="auth",nonce="%s",opaque="%s"' % (self.config['realm'], nonce, opaque)
+        headers['Content-type'] = 'text/html'
+        self.set_headers(401, headers)
+
+    def parse_htdigest(self, filename):
+        users = {}
+
+        with open(filename) as htdigest:
+            for line in htdigest:
+                line = line.strip()
+                user, realm, checksum = line.split(':')
+                if realm == self.config['realm']:
+                    users[user] = checksum
+
+        return users
+
+    def _parse_auth(self, auth):
+        fields = {}
+
+        line_parts = auth.split(',')
+        for part in line_parts:
+            part = part.strip()
+            equal = part.find('=')
+            key = part[:equal].strip().split(' ')[-1]
+            value = part[equal+1:]
+            if value.strip()[0] == '"':
+                fields[key] = value.strip()[1:-1]
+            else:
+                fields[key] = value.strip()
+
+        required = ['opaque', 'nonce', 'username', 'realm', 'response',
+                    'qop', 'cnonce', 'nc', 'uri']
+
+        for field in required:
+            if field not in fields:
+                logging.debug('missing field: %s', field)
+                return False
+
+        if fields['qop'] != 'auth':
+            logging.debug('bad qop')
+            return False
+
+        if fields['realm'] != self.config['realm']:
+            logging.debug('bad realm')
+            return False
+
+        return fields
+
+    def check_auth(self, method):
+        auth = self.headers.getheader('Authorization')
+        if auth is None:
+            logging.debug('missing auth')
+            self.need_auth()
+            return False
+
+        logging.debug("GOT %s %s", repr(method), repr(auth))
+        fields = self._parse_auth(auth)
+        if fields == False:
+            self.need_auth()
+            return False
+
+        opaque = fields['opaque']
+        nonce = fields['nonce']
+        user = fields['username']
+
+        if nonce not in self.nonces or self.nonces[nonce] != opaque:
+            logging.debug("bad nonce")
+            self.need_auth()
+            return False
+
+        # nonces can only be used once
+        del self.nonces[nonce]
+
+        users = self.parse_htdigest('.htdigest')
+
+        if user not in users:
+            logging.debug('invalid user')
+            self.need_auth()
+            return False
+
+        ha1 = users[user]
+
+        ha2 = hashlib.md5("%s:%s" % (method, fields['uri'])).hexdigest()
+        resp = hashlib.md5("%s:%s:%s:%s:%s:%s" % (ha1, nonce, fields['nc'], fields['cnonce'], fields['qop'], ha2)).hexdigest()
+        if resp != fields['response']:
+            logging.debug("bad response")
+            self.need_auth()
+            return False
+
+        return True
+
+    def get_form(self):
+        return cgi.FieldStorage(fp=self.rfile, headers=self.headers,
+                                environ={'REQUEST_METHOD':'POST',
+                                         'CONTENT_TYPE':self.headers['Content-Type'],})
+
+    @staticmethod
+    def is_valid_filter(infile):
+        infile.seek(0)
+        lines = infile.readlines()
+        for rule in lines:
+            try:
+                TeamInterfaceHandler.ids_parser.parse(rule)
+            except SyntaxError:
+                return False
+        return True
+
+    @staticmethod
+    def is_valid_cgc(infile):
+        try:
+            # save to tempfile and use cgcef_verify to validate
+            tfile = tempfile.mkstemp()
+            write_from_file(infile, tfile[1])
+            os.close(tfile[0])
+            subprocess.check_call(["cgcef_verify", tfile[1]])
+            os.remove(tfile[1])
+        except:
+            os.remove(tfile[1])
+            return False
+        return True
+
+    def json_response(self, code, data):
+        self.set_headers(code)
+        self.wfile.write(json.dumps(data))
+
+    @staticmethod
+    def get_int(value, min_value=None, max_value=None):
+        try:
+            value = int(value)
+            if min_value is not None:
+                if value < min_value:
+                    return None
+            if max_value is not None:
+                if value > max_value:
+                    return None
+        except ValueError:
+            return None
+        return value
+
+    def post_pov(self):
+        msgs = []
+        resp = {}
+        form = self.get_form()
+
+        if 'csid' in form:
+            csid = form['csid'].value
+            if not self.is_valid_csid(csid):
+                msgs.append('invalid csid')
+        else:
+            csid = None
+            msgs.append('invalid csid')
+
+        if 'team' in form:
+            team = self.get_int(form['team'].value, 1, 7)
+            if team is None:
+                msgs.append('invalid team')
+            if team == self.config['team']:
+                msgs.append('invalid team')
+        else:
+            team = None
+            msgs.append('invalid team')
+
+        if 'throws' in form:
+            throws = self.get_int(form['throws'].value, 0, 10)
+            if throws is None:
+                msgs.append('invalid throws')
+        else:
+            msgs.append('invalid throws')
+            throws = None
+
+        fname = None
+
+        if 'file' in form:
+            pov = form['file']
+            if isinstance(pov, list):
+                #reject requests that submit a list of files
+                resp['error'] = ['only one file may be specified']
+                return self.json_response(400, resp)
+            fname = pov.filename
+        else:
+            msgs.append('malformed request')
+   
+        if fname:
+            resp["file"] = fname
+
+            ext = hash_file(pov.file)
+            resp["hash"] = ext
+
+            size = file_size(pov.file)
+            if size > self.config['max_pov']:
+                msgs.append("malformed request")
+
+            if not self.is_valid_cgc(pov.file):
+                msgs.append("invalid format")
+
+            if len(msgs) == 0:
+                timestamp = int(time.time())
+                prefix = "%s%s%s" % (os.curdir, os.sep, self.path)
+                write_from_file(pov.file, os.path.join(prefix, "%s_%s_%d_%d_%d.pov" % (csid, ext, team, throws, timestamp)))
+       
+        if len(msgs):
+            code = 400
+            resp['error'] = msgs
+        else:
+            code = 200
+            resp['round'] = get_current_round()
+
+        self.json_response(code, resp)
+
+    def post_ids(self):
+        msgs = []
+        resp = {} # 'file': '', 'hash':''}
+        form = self.get_form()
+
+        msgs = []
+
+        if 'csid' in form: 
+            csid = form['csid'].value
+            if not self.is_valid_csid(csid):
+                msgs.append('invalid csid')
+        else:
+            msgs.append('invalid csid')
+
+        if 'file' in form:
+            ids_file = form['file']
+            fname = ids_file.filename
+          
+            if not fname:
+                msgs.append('invalid format')
+    
+            resp["file"] = fname
+            ext = hash_file(ids_file.file)
+            resp["hash"] = ext
+            
+            size = file_size(ids_file.file)
+            if size > self.config['max_ids']:
+                msgs.append("malformed request")
+            
+            if not self.is_valid_filter(ids_file.file):
+                msgs.append('invalid format')
+
+        else:
+            msgs.append('malformed request')
+       
+        if not len(msgs):
+            timestamp = int(time.time())
+            prefix = "%s%s%s" % (os.curdir, os.sep, self.path)
+            write_from_file(ids_file.file, os.path.join(prefix, "%s_%s_%d.ids" % (csid, ext, timestamp)))
+
+            code = 200
+            resp["round"] = get_current_round()
+        else:
+            code = 400
+            resp['error'] = msgs
+            
+        return self.json_response(code, resp)
+
+    def post_rcb(self):
+        msgs = []
+        resp = {}
+        files = []
+
+        form = self.get_form()
+
+        fnames = []
+
+        csid = None
+        if 'csid' in form:
+            csid = form['csid'].value
+            if not self.is_valid_csid(csid):
+                msgs.append('invalid csid')
+        else:
+            msgs.append('invalid csid')
+
+        for form_field in form:
+            form_value = form[form_field]
+            if isinstance(form_value, list):
+                msgs.append('malformed request')
+                break
+
+            if form_value.filename:
+                #this is a file field
+                form_dict = {}
+                form_dict["file"] = form_field
+                if form_field in fnames:
+                    if 'duplicate cbid' not in msgs:
+                        msgs.append('duplicate cbid')
+                    continue
+
+                fnames.append(form_field)
+
+                if csid is not None and self.is_valid_csid(csid):
+                    if not self.is_valid_cb_name(csid, form_field):
+                        if 'invalid cbid' not in msgs:
+                            msgs.append('invalid cbid')
+
+                form_dict["hash"] = hash_file(form_value.file)
+            
+                size = file_size(form_value.file)
+                if size > self.config['max_rcb']:
+                    msgs.append("malformed request")
+
+                if self.is_valid_cgc(form_value.file):
+                    form_dict["valid"] = "yes"
+                else:
+                    form_dict["valid"] = "no"
+                    if 'invalid format' not in msgs:
+                        msgs.append("invalid format")
+
+                files.append(form_dict)
+
+        if len(files) == 0 and not len(msgs):
+            msgs.append('malformed request')
+        else:
+            resp["files"] = files
+
+        if len(msgs) > 0:
+            resp["error"] = msgs
+            self.json_response(400, resp)
+            return
+
+        #no errors and there are files, so save the files
+        for form_dict in files:
+            form_value = form[form_dict["file"]]
+            # The field contains an uploaded file
+            form_value.file.seek(0)
+            ext = form_dict["hash"]
+            timestamp = int(time.time())
+            prefix = "%s%s%s" % (os.curdir, os.sep, self.path)
+            write_from_file(form_value.file, os.path.join(prefix, "%s_%s_%d" % (form_dict["file"], ext, timestamp)))
+
+        resp['round'] = get_current_round() 
+        return self.json_response(200, resp)
+
+    def do_GET(self):
+        if not self.check_auth("GET"):
+            return
+
+        #work around os.path.join when component is an absolute path like self.path
+        actual_path = "%s%s%s" % (os.curdir, os.sep, self.path)
+
+        #next if doc doesn't exit, then NOT FOUND
+        if not os.path.isfile(actual_path):
+            logging.debug("404 due to file not existing: %s", actual_path)
+            self.set_headers(404)
+            return
+
+        for regex in self.files:
+            if regex.match(self.path):
+                self.set_headers(200, {'Content-type': self.files[regex]})
+                write_to_file(actual_path, self.wfile)
+                return
+
+        #shouldn't be here if document exists but URI didn't match any of our patterns
+        logging.error("No pattern matched: %s\n", self.path)
+        self.set_headers(403)
+
+    def do_POST(self):
+        if not self.check_auth("POST"):
+            return
+
+        methods = {'/rcb': self.post_rcb,
+                   '/ids': self.post_ids,
+                   '/pov': self.post_pov}
+
+        if self.path in methods:
+            methods[self.path]()
+        else:
+            logging.error("403 dues to self.path not existing in methods")
+            self.set_headers(403)
+
+def add_auth(filename, realm, username, password):
+    digest = hashlib.md5('%s:%s:%s' % (username, realm, password)).hexdigest()
+    entry = '%s:%s:%s\n' % (username, realm, digest)
+
+    if os.path.isfile(filename):
+        with open(filename, 'r') as filehandle:
+            for line in filehandle.readlines():
+                if entry == line:
+                    return
+
+    with open(filename, 'a') as filehandle:
+        filehandle.write(entry)
+
+def get_challenges(directory):
+    dirnames = os.listdir(directory)
+    assert len(dirnames), 'No installed CBs in %s' % (directory)
+
+    challenges = {}
+
+    for csid in dirnames:
+        path = os.path.join(directory, csid, 'bin')
+        assert os.path.isdir(path), 'Not a valid CB : %s - %s' % (csid, path)
+
+        cbnames = [x for x in os.listdir(path) if '_patched' not in x]
+        assert len(cbnames), "Not a valid CB: %s - No binaries" % (csid)
+        challenges[csid] = len(cbnames)
+
+    return challenges
+
+def main():
+    formatter = argparse.ArgumentDefaultsHelpFormatter
+    parser = argparse.ArgumentParser(description='Simulation of CFE team API',
+                                     formatter_class=formatter)
+
+    parser.add_argument('--debug', required=False, action='store_true',
+                        default=False, help='Enable debugging')
+    parser.add_argument('--team', required=False, type=int, default=1,
+                        help='Run as the server for the specified team')
+    parser.add_argument('--port', required=False, type=int, default=1996,
+                        help='TCP Port to listen')
+    parser.add_argument('--daemonize', required=False, action='store_true',
+                        default=False, help='Run as a daemon')
+    parser.add_argument('--cbdir', required=False, type=str,
+                        default='/usr/share/cgc-challenges',
+                        help='Initial CB directory')
+    parser.add_argument('--username', required=False, type=str,
+                        default='vagrant', help='Username for client to use')
+    parser.add_argument('--password', required=False, type=str,
+                        default='vagrant', help='Password for client to use')
+    parser.add_argument('--webroot', required=False, type=str,
+                        default="/tmp/virtual-competition/webroot",
+                        help='ti-server web root directory; attempts to create if it does not exist')
+    parser.add_argument('--max_pov', required=False, type=int,
+                        default=1024*10000)
+    parser.add_argument('--max_ids', required=False, type=int,
+                        default=1024*10000)
+    parser.add_argument('--max_rcb', required=False, type=int,
+                        default=1024*50000)
+
+    args = parser.parse_args()
+    
+    assert os.path.isdir(args.cbdir), "--cbdir is not a directory: %s. Virtual Competition requires CBs to be present." % args.cbdir
+
+    logger = logging.getLogger()
+    logger.setLevel(logging.WARNING)
+    if args.debug:
+        logger.setLevel(logging.DEBUG)
+
+    webroot_abs = os.path.abspath(args.webroot)
+
+    if not os.path.exists(args.webroot):
+        os.makedirs(args.webroot)
+
+    os.chdir(args.webroot)
+    
+    httpd = TcpServer(("", args.port), TeamInterfaceHandler)
+    print "serving at port %s" % args.port
+    sys.stdout.flush()
+
+    for directory in ['rcb', 'pov', 'ids']:
+        try_makedirs(directory)
+
+    config = {'challenges': get_challenges(args.cbdir), 
+              'realm': 'CGC',
+              'team': args.team, 
+              'max_ids': args.max_ids,
+              'max_rcb': args.max_rcb,
+              'max_pov': args.max_pov
+              }
+
+    add_auth('.htdigest', config['realm'], args.username, args.password)
+
+    TeamInterfaceHandler.config = config
+    if args.daemonize:
+        with daemon.DaemonContext(uid=1000, gid=1000, stderr=sys.stderr, stdout=sys.stdout, stdin=sys.stdin, working_directory=webroot_abs, files_preserve=[httpd.fileno()]):
+            httpd.serve_forever()
+    else:
+        httpd.serve_forever()
+
+if __name__ == "__main__":
+    exit(main())
